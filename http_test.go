@@ -3427,7 +3427,7 @@ func testReadBodyChunked(t *testing.T, bodySize int) {
 
 	r := bytes.NewBuffer(chunkedBody)
 	br := bufio.NewReader(r)
-	b, err := readBodyChunked(br, 0, nil)
+	b, err := readBodyChunked(br, 0, nil, nil)
 	if err != nil {
 		t.Fatalf("Unexpected error for bodySize=%d: %v. body=%q, chunkedBody=%q", bodySize, err, body, chunkedBody)
 	}
@@ -3440,7 +3440,7 @@ func testReadBodyFixedSize(t *testing.T, bodySize int) {
 	body := createFixedBody(bodySize)
 	r := bytes.NewBuffer(body)
 	br := bufio.NewReader(r)
-	b, err := readBody(br, bodySize, 0, nil)
+	b, err := readBody(br, bodySize, 0, nil, nil)
 	if err != nil {
 		t.Fatalf("Unexpected error in ReadResponseBody(%d): %v", bodySize, err)
 	}

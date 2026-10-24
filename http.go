@@ -50,6 +50,11 @@ type Request struct {
 	// still installed as bodyStream.
 	serverStream *requestStream
 
+	// memAcct reserves body buffer growth against the server's byte budget
+	// while the request is being read. It is set by the server connection
+	// loop and stays nil on client-side and standalone reads.
+	memAcct *memAccount
+
 	multipartForm         *multipart.Form
 	multipartFormBoundary string
 
@@ -1459,6 +1464,9 @@ func (req *Request) Reset() {
 
 func (req *Request) resetSkipHeader() {
 	req.ResetBody()
+	// The account is owned by the connection loop, not the request; a
+	// pooled Request must never hold on to it after the request is reset.
+	req.memAcct = nil
 	req.uri.Reset()
 	req.parsedURI = false
 	req.uriParseErr = nil
@@ -1674,14 +1682,14 @@ func (req *Request) ReadBody(r *bufio.Reader, contentLength, maxBodySize int) (e
 
 	switch {
 	case contentLength >= 0:
-		bodyBuf.B, err = readBody(r, contentLength, maxBodySize, bodyBuf.B)
+		bodyBuf.B, err = readBody(r, contentLength, maxBodySize, bodyBuf.B, req.memAcct)
 	case contentLength == -1:
-		bodyBuf.B, err = readBodyChunked(r, maxBodySize, bodyBuf.B)
+		bodyBuf.B, err = readBodyChunked(r, maxBodySize, bodyBuf.B, req.memAcct)
 		if err == nil && len(bodyBuf.B) == 0 {
 			req.Header.SetContentLength(0)
 		}
 	default:
-		bodyBuf.B, err = readBodyIdentity(r, maxBodySize, bodyBuf.B)
+		bodyBuf.B, err = readBodyIdentity(r, maxBodySize, bodyBuf.B, req.memAcct)
 		req.Header.SetContentLength(len(bodyBuf.B))
 	}
 
@@ -1733,7 +1741,7 @@ func (req *Request) ContinueReadBodyStream(r *bufio.Reader, maxBodySize int, pre
 
 	bodyBuf := req.bodyBuffer()
 	bodyBuf.Reset()
-	bodyBuf.B, err = readBodyWithStreaming(r, contentLength, maxBodySize, bodyBuf.B)
+	bodyBuf.B, err = readBodyWithStreaming(r, contentLength, maxBodySize, bodyBuf.B, req.memAcct)
 	if err != nil {
 		if err == ErrBodyTooLarge {
 			req.Header.SetContentLength(contentLength)
@@ -1854,11 +1862,11 @@ func (resp *Response) ReadBody(r *bufio.Reader, maxBodySize int) (err error) {
 
 	switch {
 	case contentLength >= 0:
-		bodyBuf.B, err = readBody(r, contentLength, maxBodySize, bodyBuf.B)
+		bodyBuf.B, err = readBody(r, contentLength, maxBodySize, bodyBuf.B, nil)
 	case contentLength == -1:
-		bodyBuf.B, err = readBodyChunked(r, maxBodySize, bodyBuf.B)
+		bodyBuf.B, err = readBodyChunked(r, maxBodySize, bodyBuf.B, nil)
 	default:
-		bodyBuf.B, err = readBodyIdentity(r, maxBodySize, bodyBuf.B)
+		bodyBuf.B, err = readBodyIdentity(r, maxBodySize, bodyBuf.B, nil)
 		resp.Header.SetContentLength(len(bodyBuf.B))
 	}
 	return err
@@ -3192,16 +3200,16 @@ func copyZeroAllocWithLimit(w io.Writer, r io.Reader, maxBodySize int) (int64, e
 	return n, nil
 }
 
-func readBody(r *bufio.Reader, contentLength, maxBodySize int, dst []byte) ([]byte, error) {
+func readBody(r *bufio.Reader, contentLength, maxBodySize int, dst []byte, acct *memAccount) ([]byte, error) {
 	if maxBodySize > 0 && contentLength > maxBodySize {
 		return dst, ErrBodyTooLarge
 	}
-	return appendBodyFixedSize(r, dst, contentLength)
+	return appendBodyFixedSize(r, dst, contentLength, acct)
 }
 
 var errChunkedStream = errors.New("chunked stream")
 
-func readBodyWithStreaming(r *bufio.Reader, contentLength, maxBodySize int, dst []byte) (b []byte, err error) {
+func readBodyWithStreaming(r *bufio.Reader, contentLength, maxBodySize int, dst []byte, acct *memAccount) (b []byte, err error) {
 	if contentLength == -1 {
 		// handled in requestStream.Read()
 		return b, errChunkedStream
@@ -3218,7 +3226,7 @@ func readBodyWithStreaming(r *bufio.Reader, contentLength, maxBodySize int, dst 
 	// in the br buffer, if there is one. The original two branches can
 	// be handled with this single branch. by the way,
 	// fix issue: https://github.com/valyala/fasthttp/issues/1816
-	b, err = appendBodyFixedSize(r, dst, readN)
+	b, err = appendBodyFixedSize(r, dst, readN, acct)
 	if err != nil {
 		return b, err
 	}
@@ -3228,7 +3236,7 @@ func readBodyWithStreaming(r *bufio.Reader, contentLength, maxBodySize int, dst 
 	return b, nil
 }
 
-func readBodyIdentity(r *bufio.Reader, maxBodySize int, dst []byte) ([]byte, error) {
+func readBodyIdentity(r *bufio.Reader, maxBodySize int, dst []byte, acct *memAccount) ([]byte, error) {
 	dst = dst[:cap(dst)]
 	if len(dst) == 0 {
 		dst = make([]byte, 1024)
@@ -3255,6 +3263,11 @@ func readBodyIdentity(r *bufio.Reader, maxBodySize int, dst []byte) ([]byte, err
 			if maxBodySize > 0 && n > maxBodySize {
 				n = maxBodySize + 1
 			}
+			// Reserve the doubled capacity before allocating it; a denied
+			// budget fails the read instead of growing the buffer.
+			if err := acct.growBody(cap(dst), n); err != nil {
+				return dst[:offset], err
+			}
 			b := make([]byte, n)
 			copy(b, dst)
 			dst = b
@@ -3262,7 +3275,7 @@ func readBodyIdentity(r *bufio.Reader, maxBodySize int, dst []byte) ([]byte, err
 	}
 }
 
-func appendBodyFixedSize(r *bufio.Reader, dst []byte, n int) ([]byte, error) {
+func appendBodyFixedSize(r *bufio.Reader, dst []byte, n int, acct *memAccount) ([]byte, error) {
 	if n == 0 {
 		return dst, nil
 	}
@@ -3270,7 +3283,14 @@ func appendBodyFixedSize(r *bufio.Reader, dst []byte, n int) ([]byte, error) {
 	offset := len(dst)
 	dstLen := offset + n
 	if cap(dst) < dstLen {
-		b := make([]byte, roundUpForSliceCap(dstLen))
+		newCap := roundUpForSliceCap(dstLen)
+		// The body buffer is about to grow: reserve the additional bytes
+		// first. A denied budget releases what this read already reserved
+		// and returns a recognizable rejection without allocating.
+		if err := acct.growBody(cap(dst), newCap); err != nil {
+			return dst[:offset], err
+		}
+		b := make([]byte, newCap)
 		copy(b, dst)
 		dst = b
 	}
@@ -3300,7 +3320,7 @@ type ErrBrokenChunk struct {
 	error
 }
 
-func readBodyChunked(r *bufio.Reader, maxBodySize int, dst []byte) ([]byte, error) {
+func readBodyChunked(r *bufio.Reader, maxBodySize int, dst []byte, acct *memAccount) ([]byte, error) {
 	if len(dst) > 0 {
 		// data integrity might be in danger. No idea what we received,
 		// but nothing we should write to.
@@ -3319,7 +3339,7 @@ func readBodyChunked(r *bufio.Reader, maxBodySize int, dst []byte) ([]byte, erro
 		if maxBodySize > 0 && len(dst)+chunkSize > maxBodySize {
 			return dst, ErrBodyTooLarge
 		}
-		dst, err = appendBodyFixedSize(r, dst, chunkSize+strCRLFLen)
+		dst, err = appendBodyFixedSize(r, dst, chunkSize+strCRLFLen, acct)
 		if err != nil {
 			return dst, err
 		}

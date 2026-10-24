@@ -176,6 +176,7 @@ type Server struct {
 	//   * ErrSmallBuffer
 	//   * ErrBodyTooLarge
 	//   * ErrBrokenChunks
+	//   * ErrMemoryBudgetExceeded
 	ErrorHandler func(ctx *RequestCtx, err error)
 
 	// HeaderReceived is called after receiving the header.
@@ -489,6 +490,37 @@ type Server struct {
 	// bounded. Calling PostBody or Request.Body reads the entire remaining body
 	// into memory.
 	StreamRequestBody bool
+
+	// MemoryBudgetBytes is the total number of bytes the server may reserve
+	// at any moment across all connections for request body buffers and
+	// per-connection response write buffers. It adds a process-wide cap on
+	// top of the per-request MaxRequestBodySize and per-connection
+	// ReadBufferSize/WriteBufferSize limits, which keep working independently.
+	//
+	// Before a request body buffer grows or a response write buffer is
+	// acquired, the required bytes are reserved from the budget. If the
+	// budget is exhausted, the new read fails immediately with
+	// ErrMemoryBudgetExceeded (the client receives
+	// StatusServiceUnavailable and the connection is closed) and the bytes
+	// reserved by that read are released at once, instead of waiting for the
+	// process to run out of memory.
+	//
+	// Reserved bytes are returned as soon as a request finishes - including
+	// when the handler returns early without reading the whole body, when the
+	// connection is hijacked, or when the handler panics - so the current
+	// usage drops back on its own after a load spike without a restart.
+	//
+	// A value of zero (the default) disables budgeting and leaves the
+	// server behavior unchanged.
+	MemoryBudgetBytes int
+
+	// memBudget owns the byte accounting for MemoryBudgetBytes. It is
+	// configured per connection so both Serve and ServeConn honor it.
+	memBudget memBudget
+
+	// memAcctPool recycles the per-connection memAccount values so acquiring
+	// one is allocation-free on the steady-state ServeConn path.
+	memAcctPool sync.Pool
 }
 
 // TimeoutHandler creates RequestHandler, which returns StatusRequestTimeout
@@ -698,6 +730,9 @@ func (ctx *RequestCtx) EarlyHints() error {
 	links := ctx.Response.Header.PeekAll(b2s(strLink))
 	if len(links) > 0 {
 		c := acquireWriter(ctx)
+		if c == nil {
+			return ErrMemoryBudgetExceeded
+		}
 		defer releaseWriter(ctx.s, c)
 		_, err := c.Write(strEarlyHints)
 		if err != nil {
@@ -2333,6 +2368,35 @@ func (s *Server) GetRejectedConnectionsCount() uint32 {
 	return s.rejectedRequestsCount.Load()
 }
 
+// GetMemoryBudgetLimit returns the configured byte budget
+// (Server.MemoryBudgetBytes). Zero means budgeting is disabled.
+//
+// This function is intended be used by monitoring systems.
+func (s *Server) GetMemoryBudgetLimit() int64 {
+	return s.memBudget.limitBytes()
+}
+
+// GetMemoryBudgetUsage returns the number of bytes currently reserved
+// against the memory budget by in-flight request body buffers and borrowed
+// response write buffers. It returns zero when MemoryBudgetBytes is not set.
+//
+// The value drops back to zero by itself once requests finish and
+// connections go idle; no restart is required.
+//
+// This function is intended be used by monitoring systems.
+func (s *Server) GetMemoryBudgetUsage() int64 {
+	return s.memBudget.inUseBytes()
+}
+
+// GetMemoryBudgetRejectedCount returns the cumulative number of body reads
+// and response buffer acquisitions that were rejected because the byte
+// budget was exhausted. The counter only grows.
+//
+// This function is intended be used by monitoring systems.
+func (s *Server) GetMemoryBudgetRejectedCount() uint64 {
+	return s.memBudget.rejectedCount()
+}
+
 func (s *Server) getConcurrency() int {
 	n := s.Concurrency
 	if n <= 0 {
@@ -2390,6 +2454,18 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 	defer s.serveConnCleanup(countConcurrency)
 	if countConcurrency {
 		s.concurrency.Add(1)
+	}
+
+	// Pick up the configured budget for this connection. With no budget
+	// configured the account stays nil, every acquisition is a no-op and the
+	// behavior is identical to a server without budgeting.
+	s.memBudget.setLimit(s.MemoryBudgetBytes)
+	var memAcct *memAccount
+	if s.MemoryBudgetBytes > 0 {
+		memAcct = s.acquireMemAccount()
+		// releaseAll is deferred so the quota is returned on any way out:
+		// normal completion, handler early return, hijack or panic.
+		defer s.releaseMemAccount(memAcct)
 	}
 
 	proto, err := s.getNextProto(c)
@@ -2468,6 +2544,11 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 	for {
 		connRequestNum++
 
+		// The account is per-connection and outlives Request.Reset and even
+		// the ctx swap a handler timeout triggers, so bind it on every
+		// iteration before anything may grow the request body buffer.
+		ctx.Request.memAcct = memAcct
+
 		if connRequestNum == 1 {
 			// Apply ReadTimeout to the first request byte.
 			if s.ReadTimeout > 0 {
@@ -2506,6 +2587,9 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 			// while the idle timeout is active.
 			br, err = acquireByteReader(&ctx)
 		}
+		// acquireByteReader swaps in a fresh ctx, so bind the connection's
+		// budget account again before the request body may be read.
+		ctx.Request.memAcct = memAcct
 
 		ctx.Request.isTLS = isTLS
 		ctx.Request.logger = s.logger()
@@ -2665,6 +2749,13 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 			if continueReadingRequest {
 				if bw == nil {
 					bw = acquireWriter(ctx)
+					if bw == nil {
+						// Memory budget exhausted: reject the read before any
+						// request body bytes are buffered.
+						err = ErrMemoryBudgetExceeded
+						bw = s.writeErrorResponse(bw, ctx, serverName, err)
+						break
+					}
 				}
 
 				// Send 'HTTP/1.1 100 Continue' response.
@@ -2676,7 +2767,7 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 				if err != nil {
 					break
 				}
-				if s.ReduceMemoryUsage {
+				if s.shrinkBuffersWhenIdle() {
 					releaseWriter(s, bw)
 					bw = nil
 				}
@@ -2757,6 +2848,9 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 			ctx = s.acquireCtx(c)
 			ctx.connTime = connTime
 			ctx.time = reqTime
+			// Keep the connection's budget account; the timed-out request's
+			// reservation is returned with the connection cleanup.
+			ctx.Request.memAcct = memAcct
 			timeoutResponse.CopyTo(&ctx.Response)
 		}
 
@@ -2820,6 +2914,14 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 		if !hijackNoResponse {
 			if bw == nil {
 				bw = acquireWriter(ctx)
+				if bw == nil {
+					// The response buffer cannot be reserved: answer the
+					// recognizable rejection directly on the connection and
+					// close it. No response bytes have been sent yet.
+					s.writeFastError(c, StatusServiceUnavailable, "Server memory budget exceeded")
+					err = ErrMemoryBudgetExceeded
+					break
+				}
 			}
 			if err = writeResponse(ctx, bw); err != nil {
 				break
@@ -2831,7 +2933,7 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 			// consumed body can still batch pipelined responses in the writer.
 			unreadStreamBody := reqStream != nil && !reqStream.eof &&
 				(reqStream.contentLength == -1 || reqStream.totalBytesRead < reqStream.contentLength)
-			if unreadStreamBody || br == nil || br.Buffered() == 0 || connectionClose || (s.ReduceMemoryUsage && hijackHandler == nil) {
+			if unreadStreamBody || br == nil || br.Buffered() == 0 || connectionClose || (s.shrinkBuffersWhenIdle() && hijackHandler == nil) {
 				err = bw.Flush()
 				if err != nil {
 					break
@@ -2849,7 +2951,7 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 			if connectionClose {
 				break
 			}
-			if s.ReduceMemoryUsage && hijackHandler == nil {
+			if s.shrinkBuffersWhenIdle() && hijackHandler == nil {
 				releaseWriter(s, bw)
 				bw = nil
 			}
@@ -2894,6 +2996,11 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 		s.setState(c, StateIdle)
 		ctx.Request.Reset()
 		ctx.Response.Reset()
+		// The request is over: its body buffer has been pooled or reset, so
+		// its reservation must return immediately. This covers a handler that
+		// returned early as well; the deferred releaseAll only catches paths
+		// that leave the loop (connection close, hijack, panic).
+		memAcct.releaseBody()
 
 		if s.stop.Load() == 1 {
 			err = nil
@@ -3071,21 +3178,42 @@ func releaseReader(s *Server, r *bufio.Reader) {
 	s.readerPool.Put(r)
 }
 
+// acquireWriter borrows the per-connection response write buffer, reserving
+// its size against the memory budget. It returns nil when the budget is
+// exhausted; callers must handle the denial instead of writing through a nil
+// writer.
 func acquireWriter(ctx *RequestCtx) *bufio.Writer {
-	v := ctx.s.writerPool.Get()
+	s := ctx.s
+	v := s.writerPool.Get()
 	if v == nil {
-		n := ctx.s.WriteBufferSize
+		n := s.WriteBufferSize
 		if n <= 0 {
 			n = defaultWriteBufferSize
 		}
-		return bufio.NewWriterSize(ctx.c, n)
+		w := bufio.NewWriterSize(ctx.c, n)
+		if !s.memBudget.tryAcquire(w.Size()) {
+			// Nothing has been written to a fresh writer; drop it rather
+			// than pooling an unreserved buffer.
+			return nil
+		}
+		return w
 	}
 	w := v.(*bufio.Writer) //nolint:forcetypeassert
 	w.Reset(ctx.c)
+	if !s.memBudget.tryAcquire(w.Size()) {
+		// The reservation failed, so this borrow must not hold the buffer:
+		// return it to the pool and signal denial.
+		s.writerPool.Put(w)
+		return nil
+	}
 	return w
 }
 
 func releaseWriter(s *Server, w *bufio.Writer) {
+	if w == nil {
+		return
+	}
+	s.memBudget.release(int64(w.Size()))
 	s.writerPool.Put(w)
 }
 
@@ -3309,7 +3437,9 @@ func (s *Server) writeFastError(w io.Writer, statusCode int, msg string) {
 }
 
 func defaultErrorHandler(ctx *RequestCtx, err error) {
-	if _, ok := err.(*ErrSmallBuffer); ok {
+	if errors.Is(err, ErrMemoryBudgetExceeded) {
+		ctx.Error("Server memory budget exceeded", StatusServiceUnavailable)
+	} else if _, ok := err.(*ErrSmallBuffer); ok {
 		ctx.Error("Too big request header", StatusRequestHeaderFieldsTooLarge)
 	} else if netErr, ok := err.(*net.OpError); ok && netErr.Timeout() {
 		ctx.Error("Request timeout", StatusRequestTimeout)
@@ -3332,6 +3462,23 @@ func (s *Server) writeErrorResponse(bw *bufio.Writer, ctx *RequestCtx, serverNam
 	ctx.SetConnectionClose()
 	if bw == nil {
 		bw = acquireWriter(ctx)
+	}
+
+	if bw == nil {
+		// The budget denied even the error response's write buffer. Emit the
+		// error the handler already composed straight on the connection, so
+		// the client still receives the recognizable rejection.
+		statusCode := ctx.Response.StatusCode()
+		if statusCode == 0 {
+			statusCode = StatusServiceUnavailable
+		}
+		msg := b2s(ctx.Response.Body())
+		if msg == "" {
+			msg = StatusMessage(statusCode)
+		}
+		s.writeFastError(ctx.c, statusCode, msg)
+		ctx.Response.Reset()
+		return nil
 	}
 
 	writeResponse(ctx, bw) //nolint:errcheck
