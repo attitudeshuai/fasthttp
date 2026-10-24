@@ -303,6 +303,18 @@ type Client struct {
 	// By default request write timeout is unlimited.
 	WriteTimeout time.Duration
 
+	// Maximum duration to wait for the server's '100 Continue' interim
+	// response after sending the headers of a request that contains
+	// 'Expect: 100-continue'. If the server doesn't reply within this
+	// duration, the client stops waiting and sends the request body anyway,
+	// so a server unaware of the expectation cannot stall the request.
+	//
+	// The wait is also bounded by the request timeout and ReadTimeout: when
+	// one of those is shorter, it fires first and aborts the request.
+	//
+	// By default a built-in short timeout (about one second) is used.
+	MaxExpectContinueWaitTime time.Duration
+
 	// Maximum response body size.
 	//
 	// The client returns ErrBodyTooLarge if this limit is greater than 0
@@ -615,6 +627,7 @@ func (c *Client) hostClient(host []byte, isTLS bool) (*HostClient, error) {
 		WriteBufferSize:               c.WriteBufferSize,
 		ReadTimeout:                   c.ReadTimeout,
 		WriteTimeout:                  c.WriteTimeout,
+		MaxExpectContinueWaitTime:     c.MaxExpectContinueWaitTime,
 		MaxResponseBodySize:           c.MaxResponseBodySize,
 		DisableHeaderNamesNormalizing: c.DisableHeaderNamesNormalizing,
 		DisablePathNormalizing:        c.DisablePathNormalizing,
@@ -728,6 +741,12 @@ const DefaultMaxIdleConnDuration = 10 * time.Second
 
 // DefaultMaxIdemponentCallAttempts is the default idempotent calls attempts count.
 const DefaultMaxIdemponentCallAttempts = 5
+
+// defaultMaxExpectContinueWaitTime is how long the client waits for the
+// server's '100 Continue' interim response after sending the headers of an
+// 'Expect: 100-continue' request before it stops waiting and sends the body
+// anyway (RFC 9110, section 10.1.1).
+const defaultMaxExpectContinueWaitTime = time.Second
 
 // DialFunc must establish connection to addr.
 //
@@ -929,6 +948,18 @@ type HostClient struct {
 	//
 	// By default request write timeout is unlimited.
 	WriteTimeout time.Duration
+
+	// Maximum duration to wait for the server's '100 Continue' interim
+	// response after sending the headers of a request that contains
+	// 'Expect: 100-continue'. If the server doesn't reply within this
+	// duration, the client stops waiting and sends the request body anyway,
+	// so a server unaware of the expectation cannot stall the request.
+	//
+	// The wait is also bounded by the request timeout and ReadTimeout: when
+	// one of those is shorter, it fires first and aborts the request.
+	//
+	// By default a built-in short timeout (about one second) is used.
+	MaxExpectContinueWaitTime time.Duration
 
 	// Maximum response body size.
 	//
@@ -1823,6 +1854,17 @@ var (
 	// ErrConnPoolStrategyNotImpl is returned when HostClient.ConnPoolStrategy is not implement yet.
 	// If you see this error, then you need to check your HostClient configuration.
 	ErrConnPoolStrategyNotImpl = errors.New("fasthttp: connection pool strategy is not implement")
+
+	// ErrExpectContinueRejected is returned when the server answers an
+	// 'Expect: 100-continue' request with an informational (1xx) status code
+	// other than '100 Continue' while the client is waiting for permission
+	// to send the request body.
+	//
+	// The request body is not sent and the connection is closed, because its
+	// state is undefined after an unexpected interim response. A final status
+	// code (200 or higher) is not reported through this error: such a response
+	// is delivered to the caller as-is instead.
+	ErrExpectContinueRejected = errors.New("fasthttp: unexpected status code while waiting for 100 Continue")
 )
 
 type timeoutError struct{}
@@ -3559,7 +3601,17 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	}
 
 	bw := hc.AcquireWriter(conn)
-	err = req.Write(bw)
+
+	// With 'Expect: 100-continue' only the header block goes out first; the
+	// body waits for the server's interim '100 Continue' (RFC 9110,
+	// section 10.1.1). Without the expectation the whole request is written
+	// at once, exactly as before.
+	var expectBody *expectContinueBodyWriter
+	if req.MayContinue() {
+		expectBody, err = req.writeExpectContinueHeader(bw)
+	} else {
+		err = req.Write(bw)
+	}
 
 	if resetConnection {
 		req.Header.ResetConnectionClose()
@@ -3568,7 +3620,6 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	if err == nil {
 		err = bw.Flush()
 	}
-	hc.ReleaseWriter(bw)
 
 	// Return ErrTimeout on any timeout.
 	if x, ok := err.(interface{ Timeout() bool }); ok && x.Timeout() {
@@ -3576,6 +3627,7 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	}
 
 	if err != nil {
+		hc.ReleaseWriter(bw)
 		hc.CloseConn(cc)
 		return true, err
 	}
@@ -3588,14 +3640,6 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 		}
 	}
 
-	if !readDeadline.IsZero() || cc.readDeadlineSet {
-		if err = conn.SetReadDeadline(readDeadline); err != nil {
-			hc.CloseConn(cc)
-			return true, err
-		}
-		cc.readDeadlineSet = !readDeadline.IsZero()
-	}
-
 	if customSkipBody || req.Header.IsHead() {
 		resp.SkipBody = true
 	}
@@ -3604,6 +3648,161 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	}
 
 	br := hc.AcquireReader(conn)
+
+	// earlyFinalResponse marks a server that answered the expectation with a
+	// final response instead of '100 Continue'. The request body must never be
+	// written in that case and the connection cannot go back to the pool.
+	earlyFinalResponse := false
+
+	if expectBody != nil {
+		waitDuration := hc.MaxExpectContinueWaitTime
+		if waitDuration <= 0 {
+			waitDuration = defaultMaxExpectContinueWaitTime
+		}
+		waitDeadline := time.Now().Add(waitDuration)
+		// The wait is bounded by whichever comes first: the dedicated
+		// expectation wait or the overall request/read deadline.
+		interimReadDeadline := waitDeadline
+		// requestDeadlineBinds reports that a timeout while waiting is the
+		// request or read timeout rather than the dedicated expectation wait.
+		requestDeadlineBinds := false
+		if !readDeadline.IsZero() && !readDeadline.After(waitDeadline) {
+			interimReadDeadline = readDeadline
+			requestDeadlineBinds = true
+		}
+
+		if !interimReadDeadline.IsZero() || cc.readDeadlineSet {
+			if err = conn.SetReadDeadline(interimReadDeadline); err != nil {
+				hc.ReleaseWriter(bw)
+				hc.ReleaseReader(br)
+				hc.CloseConn(cc)
+				return true, err
+			}
+			cc.readDeadlineSet = !interimReadDeadline.IsZero()
+		}
+
+		if err = resp.Header.Read(br); err != nil {
+			if x, ok := err.(interface{ Timeout() bool }); ok && x.Timeout() {
+				if requestDeadlineBinds {
+					// The overall request timeout expired while waiting: the
+					// body is unsent and the server may still expect it, so the
+					// request is aborted and the connection is not reused.
+					hc.ReleaseWriter(bw)
+					hc.ReleaseReader(br)
+					hc.CloseConn(cc)
+					return true, ErrTimeout
+				}
+				// The dedicated wait expired: stop waiting and send the body
+				// anyway. The Peek-based header read consumed no bytes, so no
+				// half-read response is left on the connection.
+				err = nil
+			} else {
+				hc.ReleaseWriter(bw)
+				hc.ReleaseReader(br)
+				hc.CloseConn(cc)
+				return true, err
+			}
+		} else {
+			switch statusCode := resp.Header.StatusCode(); {
+			case statusCode == StatusContinue:
+				// Permission granted: the body is sent below.
+			case statusCode >= StatusOK:
+				// A final response arrived before the body. Keep the response
+				// and skip the body; the connection is closed afterwards.
+				earlyFinalResponse = true
+			default:
+				// An unsupported informational status (for example 101 or
+				// 103): treat it as a rejection with a distinguishable error.
+				// The connection state is undefined, so close it instead of
+				// returning it to the pool.
+				err = fmt.Errorf("%w: got %d %s", ErrExpectContinueRejected, statusCode, StatusMessage(statusCode))
+				hc.ReleaseWriter(bw)
+				hc.ReleaseReader(br)
+				hc.CloseConn(cc)
+				return false, err
+			}
+		}
+	}
+
+	if earlyFinalResponse {
+		hc.ReleaseWriter(bw)
+
+		// The final response body gets the normal read deadline rather than
+		// the short interim one.
+		if !readDeadline.IsZero() || cc.readDeadlineSet {
+			if err = conn.SetReadDeadline(readDeadline); err != nil {
+				hc.ReleaseReader(br)
+				hc.CloseConn(cc)
+				return true, err
+			}
+			cc.readDeadlineSet = !readDeadline.IsZero()
+		}
+
+		if err = resp.readBodyAfterHeader(br, hc.MaxResponseBodySize); err != nil {
+			hc.ReleaseReader(br)
+			hc.CloseConn(cc)
+			// Don't retry in case of ErrBodyTooLarge since we will just get the same again.
+			needRetry := err != ErrBodyTooLarge
+			return needRetry, err
+		}
+
+		// The declared request body was never sent. Even if the response
+		// promises keep-alive only the server knows whether it drained that
+		// body, so never pool this connection.
+		if customStreamBody && resp.bodyStream != nil {
+			rs := resp.bodyStream.(*requestStream) //nolint:forcetypeassert
+			resp.bodyStream = &clientStreamBody{
+				reader:    rs,
+				fullyRead: rs.contentLength == 0,
+				interrupt: func() {
+					_ = conn.Close()
+				},
+				release: func(discard bool) {
+					hc.ReleaseReader(br)
+					releaseRequestStream(rs)
+					// Always close: the unsent request body forbids reuse.
+					hc.CloseConn(cc)
+				},
+			}
+			return false, nil
+		}
+		hc.ReleaseReader(br)
+		hc.CloseConn(cc)
+		return false, nil
+	}
+
+	if expectBody != nil {
+		// '100 Continue' was received (or the wait expired): finish sending
+		// the request. The write deadline installed above still applies.
+		if err = expectBody.writeBody(bw); err == nil {
+			err = bw.Flush()
+		}
+
+		// Return ErrTimeout on any timeout.
+		if x, ok := err.(interface{ Timeout() bool }); ok && x.Timeout() {
+			err = ErrTimeout
+		}
+		if err != nil {
+			hc.ReleaseWriter(bw)
+			hc.ReleaseReader(br)
+			hc.CloseConn(cc)
+			return true, err
+		}
+	}
+	hc.ReleaseWriter(bw)
+
+	// Restore the normal read deadline before reading the final response: the
+	// interim wait may have installed a shorter deadline. When no expectation
+	// was declared this is the same single deadline set as in the old flow.
+	if !readDeadline.IsZero() || cc.readDeadlineSet {
+		if err = conn.SetReadDeadline(readDeadline); err != nil {
+			hc.ReleaseReader(br)
+			hc.CloseConn(cc)
+			return true, err
+		}
+		cc.readDeadlineSet = !readDeadline.IsZero()
+	}
+
 	err = resp.ReadLimitBody(br, hc.MaxResponseBodySize)
 	if err != nil {
 		hc.ReleaseReader(br)

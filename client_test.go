@@ -6576,3 +6576,605 @@ func TestHostClientPreservesNoDefaultContentType(t *testing.T) {
 		}
 	}
 }
+
+// expectContinueDialer returns a HostClient dialer for a loopback listener.
+func expectContinueDialer(ln net.Listener) func(string) (net.Conn, error) {
+	return func(string) (net.Conn, error) {
+		return net.Dial("tcp", ln.Addr().String())
+	}
+}
+
+// readRawRequestHeaders consumes one request header block on the server side.
+func readRawRequestHeaders(t *testing.T, br *bufio.Reader) *RequestHeader {
+	t.Helper()
+	var hdr RequestHeader
+	if err := hdr.Read(br); err != nil {
+		t.Fatalf("unexpected error when reading request headers: %v", err)
+	}
+	return &hdr
+}
+
+// expectContinueWaitsForContinue verifies the client sends headers only and
+// withholds the body until '100 Continue' arrives.
+func TestHostClientExpectContinueWaitsForContinue(t *testing.T) {
+	t.Parallel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	body := []byte("expect body payload")
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		br := bufio.NewReader(c)
+		hdr := readRawRequestHeaders(t, br)
+		if !caseInsensitiveCompare(hdr.Peek(HeaderExpect), str100Continue) {
+			t.Errorf("missing Expect: 100-continue header, got %q", hdr.Peek(HeaderExpect))
+		}
+		if hdr.ContentLength() != len(body) {
+			t.Errorf("unexpected content length: %d. Expecting %d", hdr.ContentLength(), len(body))
+		}
+
+		// The body must not be sent before the permission.
+		if err := c.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+			t.Error(err)
+		}
+		one := make([]byte, 1)
+		if n, err := c.Read(one); n != 0 || err == nil {
+			t.Errorf("body arrived before 100 Continue: n=%d err=%v", n, err)
+		}
+		if err := c.SetReadDeadline(time.Time{}); err != nil {
+			t.Error(err)
+		}
+
+		if _, err := c.Write([]byte("HTTP/1.1 100 Continue\r\n\r\n")); err != nil {
+			t.Error(err)
+		}
+		gotBody := make([]byte, hdr.ContentLength())
+		if _, err := io.ReadFull(br, gotBody); err != nil {
+			t.Errorf("unexpected error when reading body: %v", err)
+		} else if string(gotBody) != string(body) {
+			t.Errorf("unexpected body %q. Expecting %q", gotBody, body)
+		}
+		c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\n\r\nok")) //nolint:errcheck
+	}()
+
+	c := &HostClient{
+		Addr:                      ln.Addr().String(),
+		Dial:                      expectContinueDialer(ln),
+		MaxExpectContinueWaitTime: 5 * time.Second,
+	}
+
+	req := AcquireRequest()
+	defer ReleaseRequest(req)
+	req.Header.SetMethod(MethodPost)
+	req.SetRequestURI("http://example.com/foo")
+	req.Header.Set(HeaderExpect, "100-continue")
+	req.SetBody(body)
+
+	resp := AcquireResponse()
+	defer ReleaseResponse(resp)
+	if err := c.Do(req, resp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode() != StatusOK {
+		t.Fatalf("unexpected status code: %d. Expecting 200", resp.StatusCode())
+	}
+	if string(resp.Body()) != "ok" {
+		t.Fatalf("unexpected response body %q. Expecting %q", resp.Body(), "ok")
+	}
+	if c.IdleConnsCount() != 1 {
+		t.Fatalf("the connection must be reusable after a completed handshake, idle conns: %d", c.IdleConnsCount())
+	}
+	<-serverDone
+}
+
+// A final status before the body is delivered untouched; the body is never sent
+// and the connection is closed instead of pooled.
+func TestHostClientExpectContinueFinalResponseSkipsBody(t *testing.T) {
+	t.Parallel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	body := []byte("payload that must never leave the client")
+	bodyObserved := make(chan int, 1)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		br := bufio.NewReader(c)
+		hdr := readRawRequestHeaders(t, br)
+
+		if _, err := c.Write([]byte("HTTP/1.1 417 Expectation Failed\r\nContent-Length: 5\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nnope!")); err != nil {
+			t.Error(err)
+		}
+
+		// The client must close without sending the declared body.
+		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		buf := make([]byte, hdr.ContentLength())
+		n, _ := io.ReadFull(c, buf)
+		bodyObserved <- n
+	}()
+
+	c := &HostClient{
+		Addr:                      ln.Addr().String(),
+		Dial:                      expectContinueDialer(ln),
+		MaxExpectContinueWaitTime: 5 * time.Second,
+	}
+
+	req := AcquireRequest()
+	defer ReleaseRequest(req)
+	req.Header.SetMethod(MethodPost)
+	req.SetRequestURI("http://example.com/foo")
+	req.Header.Set(HeaderExpect, "100-continue")
+	req.SetBody(body)
+
+	resp := AcquireResponse()
+	defer ReleaseResponse(resp)
+	if err := c.Do(req, resp); err != nil {
+		t.Fatalf("a final response must be returned without error, got: %v", err)
+	}
+	if resp.StatusCode() != StatusExpectationFailed {
+		t.Fatalf("unexpected status code: %d. Expecting 417", resp.StatusCode())
+	}
+	if string(resp.Body()) != "nope!" {
+		t.Fatalf("unexpected response body %q", resp.Body())
+	}
+	if c.IdleConnsCount() != 0 {
+		t.Fatalf("connection with an unsent body must not be pooled, idle conns: %d", c.IdleConnsCount())
+	}
+	if n := <-bodyObserved; n != 0 {
+		t.Fatalf("server observed %d unexpected body bytes", n)
+	}
+	<-serverDone
+}
+
+// Informational status codes other than 100 are rejections with a
+// distinguishable error.
+func TestHostClientExpectContinueUnsupportedInterimStatus(t *testing.T) {
+	t.Parallel()
+
+	for _, interim := range []struct {
+		status int
+		text   string
+	}{
+		{StatusSwitchingProtocols, "Switching Protocols"},
+		{StatusEarlyHints, "Early Hints"},
+	} {
+		t.Run(strconv.Itoa(interim.status), func(t *testing.T) {
+			t.Parallel()
+
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+
+			bodyObserved := make(chan int, 1)
+			go func() {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				defer c.Close()
+				br := bufio.NewReader(c)
+				hdr := readRawRequestHeaders(t, br)
+				c.Write([]byte(fmt.Sprintf("HTTP/1.1 %d %s\r\n\r\n", interim.status, interim.text))) //nolint:errcheck
+				_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+				buf := make([]byte, hdr.ContentLength())
+				n, _ := io.ReadFull(c, buf)
+				bodyObserved <- n
+			}()
+
+			c := &HostClient{
+				Addr:                      ln.Addr().String(),
+				Dial:                      expectContinueDialer(ln),
+				MaxExpectContinueWaitTime: 5 * time.Second,
+			}
+
+			req := AcquireRequest()
+			defer ReleaseRequest(req)
+			req.Header.SetMethod(MethodPost)
+			req.SetRequestURI("http://example.com/foo")
+			req.Header.Set(HeaderExpect, "100-continue")
+			req.SetBodyString("rejected body")
+
+			resp := AcquireResponse()
+			defer ReleaseResponse(resp)
+			err = c.Do(req, resp)
+			if !errors.Is(err, ErrExpectContinueRejected) {
+				t.Fatalf("expected ErrExpectContinueRejected, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), strconv.Itoa(interim.status)) {
+				t.Fatalf("error %q must mention status code %d", err, interim.status)
+			}
+			if c.IdleConnsCount() != 0 {
+				t.Fatalf("the connection must be closed, idle conns: %d", c.IdleConnsCount())
+			}
+			if n := <-bodyObserved; n != 0 {
+				t.Fatalf("server observed %d unexpected body bytes", n)
+			}
+		})
+	}
+}
+
+// When the server stays silent, the dedicated wait expires and the client
+// sends the body instead of blocking forever.
+func TestHostClientExpectContinueWaitTimeoutSendsBody(t *testing.T) {
+	t.Parallel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	body := []byte("body sent after the wait expired")
+	bodyArrived := make(chan struct{}, 1)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		br := bufio.NewReader(c)
+		hdr := readRawRequestHeaders(t, br)
+
+		// Never send 100: the body must still arrive once the client's own
+		// wait expires. The wait duration is asserted on the client clock.
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		gotBody := make([]byte, hdr.ContentLength())
+		if _, err := io.ReadFull(br, gotBody); err != nil {
+			t.Errorf("unexpected error waiting for body: %v", err)
+			return
+		}
+		close(bodyArrived)
+		if string(gotBody) != string(body) {
+			t.Errorf("unexpected body %q. Expecting %q", gotBody, body)
+		}
+		_ = c.SetReadDeadline(time.Time{})
+		c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\n\r\nok")) //nolint:errcheck
+	}()
+
+	c := &HostClient{
+		Addr:                      ln.Addr().String(),
+		Dial:                      expectContinueDialer(ln),
+		MaxExpectContinueWaitTime: 150 * time.Millisecond,
+	}
+
+	req := AcquireRequest()
+	defer ReleaseRequest(req)
+	req.Header.SetMethod(MethodPost)
+	req.SetRequestURI("http://example.com/foo")
+	req.Header.Set(HeaderExpect, "100-continue")
+	req.SetBody(body)
+
+	resp := AcquireResponse()
+	defer ReleaseResponse(resp)
+	start := time.Now()
+	if err := c.Do(req, resp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 140*time.Millisecond {
+		t.Fatalf("body was sent too early after %v, the wait must elapse first", elapsed)
+	}
+	if resp.StatusCode() != StatusOK || string(resp.Body()) != "ok" {
+		t.Fatalf("unexpected response: %d %q", resp.StatusCode(), resp.Body())
+	}
+	// The body arrived without a '100 Continue': the wait expired instead of
+	// stalling the request forever.
+	<-bodyArrived
+	if c.IdleConnsCount() != 1 {
+		t.Fatalf("the connection must be reusable, idle conns: %d", c.IdleConnsCount())
+	}
+	<-serverDone
+}
+
+// The overall request timeout wins over the expectation wait: once it
+// expires the request is aborted with ErrTimeout, the body is not sent and no
+// half request is left on a pooled connection.
+func TestHostClientExpectContinueRequestTimeoutDuringWait(t *testing.T) {
+	t.Parallel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	bodyLen := 128
+	bodyObserved := make(chan int, 1)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		br := bufio.NewReader(c)
+		var hdr RequestHeader
+		if err := hdr.Read(br); err != nil {
+			// Under heavy scheduling pressure the client's request timeout
+			// may close the connection before this goroutine reads anything.
+			// In that case no body was sent either, which is what we assert.
+			bodyObserved <- 0
+			return
+		}
+
+		// Read until the client gives up: it must close without a body.
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		received := 0
+		buf := make([]byte, 256)
+		for {
+			n, err := c.Read(buf)
+			received += n
+			if err != nil {
+				break
+			}
+		}
+		bodyObserved <- received
+	}()
+
+	c := &HostClient{
+		Addr:                      ln.Addr().String(),
+		Dial:                      expectContinueDialer(ln),
+		MaxExpectContinueWaitTime: 10 * time.Second,
+		MaxIdemponentCallAttempts: 1,
+	}
+
+	req := AcquireRequest()
+	defer ReleaseRequest(req)
+	req.Header.SetMethod(MethodPost)
+	req.SetRequestURI("http://example.com/foo")
+	req.Header.Set(HeaderExpect, "100-continue")
+	req.SetBody(bytes.Repeat([]byte("x"), bodyLen))
+
+	resp := AcquireResponse()
+	defer ReleaseResponse(resp)
+	start := time.Now()
+	if err := c.DoTimeout(req, resp, 500*time.Millisecond); err != ErrTimeout {
+		t.Fatalf("expected ErrTimeout, got: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("request timeout took too long: %v", elapsed)
+	}
+	if c.IdleConnsCount() != 0 {
+		t.Fatalf("an aborted request must not return the connection to the pool: %d", c.IdleConnsCount())
+	}
+	if n := <-bodyObserved; n != 0 {
+		t.Fatalf("server observed %d body bytes after the request timed out", n)
+	}
+	<-serverDone
+}
+
+// Without the Expect header the request body is written together with the
+// headers, exactly as before.
+func TestHostClientNoExpectWritesBodyImmediately(t *testing.T) {
+	t.Parallel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	body := []byte("immediate body")
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		br := bufio.NewReader(c)
+		hdr := readRawRequestHeaders(t, br)
+
+		// The body must be readable right away, without sending anything.
+		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		gotBody := make([]byte, hdr.ContentLength())
+		if _, err := io.ReadFull(br, gotBody); err != nil {
+			t.Errorf("unexpected error reading the immediate body: %v", err)
+			return
+		}
+		if string(gotBody) != string(body) {
+			t.Errorf("unexpected body %q. Expecting %q", gotBody, body)
+		}
+		c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\n\r\nok")) //nolint:errcheck
+	}()
+
+	c := &HostClient{
+		Addr: ln.Addr().String(),
+		Dial: expectContinueDialer(ln),
+	}
+
+	req := AcquireRequest()
+	defer ReleaseRequest(req)
+	req.Header.SetMethod(MethodPost)
+	req.SetRequestURI("http://example.com/foo")
+	req.SetBody(body)
+
+	resp := AcquireResponse()
+	defer ReleaseResponse(resp)
+	if err := c.Do(req, resp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode() != StatusOK || string(resp.Body()) != "ok" {
+		t.Fatalf("unexpected response: %d %q", resp.StatusCode(), resp.Body())
+	}
+	<-serverDone
+}
+
+// The Client-level wait option is propagated to its HostClient.
+func TestClientExpectContinueWaitTimeoutPropagated(t *testing.T) {
+	t.Parallel()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		br := bufio.NewReader(c)
+		hdr := readRawRequestHeaders(t, br)
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		gotBody := make([]byte, hdr.ContentLength())
+		if _, err := io.ReadFull(br, gotBody); err != nil {
+			return
+		}
+		_ = c.SetReadDeadline(time.Time{})
+		c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\n\r\nok")) //nolint:errcheck
+	}()
+
+	c := &Client{
+		Name:                      "expect-test",
+		Dial:                      expectContinueDialer(ln),
+		MaxExpectContinueWaitTime: 150 * time.Millisecond,
+	}
+
+	req := AcquireRequest()
+	defer ReleaseRequest(req)
+	req.Header.SetMethod(MethodPost)
+	req.SetRequestURI("http://example.com/foo")
+	req.Header.Set(HeaderExpect, "100-continue")
+	req.SetBodyString("client level wait")
+
+	resp := AcquireResponse()
+	defer ReleaseResponse(resp)
+	start := time.Now()
+	if err := c.Do(req, resp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if time.Since(start) < 140*time.Millisecond {
+		t.Fatal("Client.MaxExpectContinueWaitTime was not applied")
+	}
+	if resp.StatusCode() != StatusOK || string(resp.Body()) != "ok" {
+		t.Fatalf("unexpected response: %d %q", resp.StatusCode(), resp.Body())
+	}
+}
+
+// End-to-end behavior against a fasthttp Server with an ExpectHandler,
+// including keep-alive reuse, rejection and chunked streamed bodies.
+func TestHostClientExpectContinueAgainstServer(t *testing.T) {
+	t.Parallel()
+
+	ln := fasthttputil.NewInmemoryListener()
+	s := &Server{
+		ExpectHandler: func(ctx *RequestCtx) int {
+			// Reject bodies larger than 64 bytes.
+			if ctx.Request.Header.ContentLength() > 64 {
+				return StatusExpectationFailed
+			}
+			return StatusContinue
+		},
+		Handler: func(ctx *RequestCtx) {
+			ctx.SetStatusCode(StatusOK)
+			_, _ = ctx.Write(ctx.PostBody())
+		},
+	}
+	go s.Serve(ln) //nolint:errcheck
+	defer ln.Close()
+
+	c := &HostClient{
+		Addr:                      "example.com",
+		Dial:                      func(string) (net.Conn, error) { return ln.Dial() },
+		MaxExpectContinueWaitTime: 5 * time.Second,
+	}
+
+	doRequest := func(body []byte, expectReject bool) {
+		t.Helper()
+		req := AcquireRequest()
+		defer ReleaseRequest(req)
+		req.Header.SetMethod(MethodPost)
+		req.SetRequestURI("http://example.com/upload")
+		req.Header.Set(HeaderExpect, "100-continue")
+		if body != nil {
+			req.SetBody(body)
+		}
+
+		resp := AcquireResponse()
+		defer ReleaseResponse(resp)
+		if err := c.Do(req, resp); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if expectReject {
+			if resp.StatusCode() != StatusExpectationFailed {
+				t.Fatalf("unexpected status: %d, expecting 417", resp.StatusCode())
+			}
+			return
+		}
+		if resp.StatusCode() != StatusOK {
+			t.Fatalf("unexpected status: %d, expecting 200", resp.StatusCode())
+		}
+		if !bytes.Equal(resp.Body(), body) {
+			t.Fatalf("unexpected body echo %q. Expecting %q", resp.Body(), body)
+		}
+	}
+
+	// Accepted fixed-size body; the connection is reused afterwards.
+	doRequest([]byte("small body"), false)
+	if c.IdleConnsCount() != 1 {
+		t.Fatalf("expected the keep-alive connection in the pool, got %d", c.IdleConnsCount())
+	}
+
+	// An empty body needs no handshake; a 100 the server may still send is
+	// consumed as an interim response.
+	doRequest(nil, false)
+	if c.IdleConnsCount() != 1 {
+		t.Fatalf("expected the same connection to stay pooled, got %d", c.IdleConnsCount())
+	}
+
+	// Rejected large body: the response is delivered and the connection is
+	// dropped, but later requests keep working over a fresh connection.
+	doRequest(bytes.Repeat([]byte("b"), 100), true)
+	doRequest([]byte("after reject"), false)
+	if c.IdleConnsCount() != 1 {
+		t.Fatalf("expected one pooled connection after recovery, got %d", c.IdleConnsCount())
+	}
+
+	// A chunked streamed body is also held back until 100 arrives.
+	req := AcquireRequest()
+	defer ReleaseRequest(req)
+	req.Header.SetMethod(MethodPost)
+	req.SetRequestURI("http://example.com/stream")
+	req.Header.Set(HeaderExpect, "100-continue")
+	streamBody := "chunked stream body"
+	req.SetBodyStreamWriter(func(w *bufio.Writer) {
+		fmt.Fprint(w, streamBody)
+		_ = w.Flush()
+	})
+	resp := AcquireResponse()
+	defer ReleaseResponse(resp)
+	if err := c.Do(req, resp); err != nil {
+		t.Fatalf("unexpected error for streamed body: %v", err)
+	}
+	if resp.StatusCode() != StatusOK || string(resp.Body()) != streamBody {
+		t.Fatalf("unexpected streamed response: %d %q", resp.StatusCode(), resp.Body())
+	}
+}

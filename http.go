@@ -1813,17 +1813,23 @@ func (resp *Response) ReadLimitBody(r *bufio.Reader, maxBodySize int) error {
 		}
 	}
 
+	return resp.readBodyAfterHeader(r, maxBodySize)
+}
+
+// readBodyAfterHeader reads the response body and its trailer after the final
+// header block has already been consumed with Header.Read (for example, while
+// waiting for a '100 Continue' interim response that turned out to be the
+// final response).
+func (resp *Response) readBodyAfterHeader(r *bufio.Reader, maxBodySize int) error {
 	if !resp.mustSkipBody() {
-		err = resp.ReadBody(r, maxBodySize)
-		if err != nil {
+		if err := resp.ReadBody(r, maxBodySize); err != nil {
 			return err
 		}
 	}
 
 	// A response without a body can't have trailers.
 	if resp.Header.ContentLength() == -1 && !resp.StreamBody && !resp.mustSkipBody() {
-		err = resp.Header.ReadTrailer(r)
-		if err != nil {
+		if err := resp.Header.ReadTrailer(r); err != nil {
 			if err == io.EOF {
 				return ErrBrokenChunk{error: io.ErrUnexpectedEOF}
 			}
@@ -1953,12 +1959,10 @@ func (req *Request) onlyMultipartForm() bool {
 	return req.multipartForm != nil && (req.body == nil || len(req.body.B) == 0)
 }
 
-// Write writes request to w.
-//
-// Write doesn't flush request to w for performance reasons.
-//
-// See also WriteTo.
-func (req *Request) Write(w *bufio.Writer) error {
+// prepareRequestHeader fills in Host and RequestURI derived from the parsed
+// URI, including the basic authorization header, before the request header
+// block is written.
+func (req *Request) prepareRequestHeader() error {
 	if len(req.Header.Host()) == 0 || req.parsedURI {
 		uri := req.URI()
 		host := uri.Host()
@@ -1990,6 +1994,18 @@ func (req *Request) Write(w *bufio.Writer) error {
 			base64.StdEncoding.Encode(buf[nb:tl], buf[:nl])
 			req.Header.SetBytesKV(strAuthorization, buf[nl:tl])
 		}
+	}
+	return nil
+}
+
+// Write writes request to w.
+//
+// Write doesn't flush request to w for performance reasons.
+//
+// See also WriteTo.
+func (req *Request) Write(w *bufio.Writer) error {
+	if err := req.prepareRequestHeader(); err != nil {
+		return err
 	}
 
 	if req.bodyStream != nil {
@@ -2044,6 +2060,180 @@ func (req *Request) Write(w *bufio.Writer) error {
 			return errors.New("non-zero body for non-post request")
 		}
 		return fmt.Errorf("non-zero body for non-post request: body=%q", body)
+	}
+	return err
+}
+
+// expectContinueBodyWriter keeps the body of an 'Expect: 100-continue'
+// request back after its header block has already been sent. The body is
+// written only once the server permitted it (or the client stopped waiting).
+type expectContinueBodyWriter struct {
+	req *Request
+
+	// body is the resolved buffered request body.
+	body []byte
+
+	// chunked is true when the buffered body is framed with chunked
+	// transfer encoding and a trailing header.
+	chunked bool
+
+	// stream is true when the body comes from req.bodyStream.
+	stream bool
+
+	// contentLength is the framing resolved for a streamed body:
+	// a non-negative value means fixed length, -1 means chunked.
+	contentLength int
+}
+
+// writeExpectContinueHeader performs exactly the same preparation and header
+// framing as Write, but sends only the request header block to w and returns
+// the body write for later.
+//
+// It returns a nil writer when the request carries no body: nothing is left
+// pending in that case and the final response may be read immediately.
+//
+// The caller must flush w before waiting for the server's decision.
+func (req *Request) writeExpectContinueHeader(w *bufio.Writer) (*expectContinueBodyWriter, error) {
+	if err := req.prepareRequestHeader(); err != nil {
+		return nil, err
+	}
+
+	if req.bodyStream != nil {
+		return req.writeExpectContinueHeaderStream(w)
+	}
+
+	body := req.bodyBytes()
+	var err error
+	if req.onlyMultipartForm() {
+		body, err = marshalMultipartForm(req.multipartForm, req.multipartFormBoundary)
+		if err != nil {
+			return nil, fmt.Errorf("error when marshaling multipart form: %w", err)
+		}
+		req.Header.SetMultipartFormBoundary(req.multipartFormBoundary)
+	}
+
+	if len(body) == 0 {
+		body = req.postArgs.QueryString()
+	}
+	hasBody := len(body) != 0 || !req.Header.ignoreBody()
+	chunked := hasBody && len(req.Header.trailer) > 0 && req.Header.IsHTTP11()
+	contentLength := len(body)
+	if chunked {
+		contentLength = -1
+	}
+	if req.Header.disableSpecialHeader {
+		if err = req.Header.setRawBodyFraming(contentLength, hasBody); err != nil {
+			return nil, err
+		}
+	} else if hasBody {
+		req.Header.SetContentLength(contentLength)
+	}
+	if chunked {
+		if len(body) > 0 && !req.Header.noDefaultContentType && len(req.Header.ContentType()) == 0 {
+			req.Header.SetContentTypeBytes(strDefaultContentType)
+		}
+		if err = req.Header.Write(w); err != nil {
+			return nil, err
+		}
+		return &expectContinueBodyWriter{
+			req:     req,
+			body:    body,
+			chunked: true,
+		}, nil
+	}
+	if err = req.Header.Write(w); err != nil {
+		return nil, err
+	}
+	if !hasBody {
+		if len(body) > 0 {
+			if req.secureErrorLogMessage {
+				return nil, errors.New("non-zero body for non-post request")
+			}
+			return nil, fmt.Errorf("non-zero body for non-post request: body=%q", body)
+		}
+		return nil, nil
+	}
+	return &expectContinueBodyWriter{
+		req:  req,
+		body: body,
+	}, nil
+}
+
+// writeExpectContinueHeaderStream resolves the framing of a streamed request
+// body and sends only its header block, mirroring writeBodyStream's header
+// handling without consuming the stream.
+func (req *Request) writeExpectContinueHeaderStream(w *bufio.Writer) (*expectContinueBodyWriter, error) {
+	var err error
+
+	contentLength := req.Header.ContentLength()
+	if req.Header.disableSpecialHeader && req.Header.contentLength != -2 {
+		// SetBodyStream's size is authoritative for outgoing raw headers.
+		// A parsed raw request has no dedicated size, so use its validated
+		// framing field when forwarding its body stream.
+		contentLength = req.Header.contentLength
+	}
+	if contentLength < 0 && !req.Header.disableSpecialHeader {
+		lrSize := limitedReaderSize(req.bodyStream)
+		if lrSize >= 0 {
+			contentLength = int(lrSize)
+			if int64(contentLength) != lrSize {
+				contentLength = -1
+			}
+			if contentLength >= 0 {
+				req.Header.SetContentLength(contentLength)
+			}
+		}
+	}
+	if req.Header.disableSpecialHeader {
+		if err = req.Header.setRawBodyFraming(contentLength, true); err != nil {
+			_ = req.closeBodyStream()
+			return nil, err
+		}
+	} else if contentLength < 0 {
+		req.Header.SetContentLength(-1)
+	}
+	req.Header.written = true
+	err = req.Header.Write(w)
+	req.Header.written = false
+	if err != nil {
+		return nil, err
+	}
+	return &expectContinueBodyWriter{
+		req:           req,
+		stream:        true,
+		contentLength: contentLength,
+	}, nil
+}
+
+// writeBody sends the deferred request body. It must not be called once the
+// server has answered the expectation with a final response: in that case the
+// connection cannot carry both the unsent request body and a clean next
+// request.
+func (ew *expectContinueBodyWriter) writeBody(w *bufio.Writer) error {
+	if ew == nil {
+		return nil
+	}
+	if !ew.stream {
+		if ew.chunked {
+			if err := writeBufferedBodyChunked(w, ew.body); err != nil {
+				return err
+			}
+			return ew.req.Header.writeTrailer(w)
+		}
+		_, err := w.Write(ew.body)
+		return err
+	}
+
+	req := ew.req
+	var err error
+	if ew.contentLength >= 0 {
+		err = writeBodyFixedSize(w, req.bodyStream, int64(ew.contentLength), &req.bodyStreamWriter)
+	} else if err = writeBodyChunked(w, req.bodyStream); err == nil {
+		err = req.Header.writeTrailer(w)
+	}
+	errc := req.closeBodyStream()
+	if err == nil {
+		err = errc
 	}
 	return err
 }
