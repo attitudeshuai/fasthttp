@@ -386,6 +386,29 @@ type Client struct {
 	// If Do is called with a nil Response, the client drains only small,
 	// known-length bodies for connection reuse and closes other body streams.
 	StreamResponseBody bool
+
+	// MaxReplayBodySize enables retaining a streamed request body so that
+	// retries and body-preserving redirects (307/308, and 301/302 on POST)
+	// can send the body again instead of failing or replaying an empty body.
+	//
+	// While the request is sent, the bytes consumed from the body stream are
+	// buffered in memory, up to this many bytes. On a retry or redirect the
+	// body is replayed from the buffer and the remainder is read from the
+	// stream, which keeps working when the connection is replaced, the TLS
+	// handshake is redone, or the redirect points at another address.
+	//
+	// If more than this many bytes have been consumed when a replay is needed,
+	// the request fails with ErrBodyStreamNotReplayable rather than sending a
+	// truncated or empty body.
+	//
+	// The buffer is released as soon as the request (or redirect chain) ends
+	// and does not accumulate across requests.
+	//
+	// A value of zero (the default) disables replay buffering: streamed
+	// bodies are not retried, body-preserving redirects fail with
+	// ErrRedirectBodyStream, and retry counts, timeout budgets, and redirect
+	// behavior are otherwise unchanged.
+	MaxReplayBodySize int
 }
 
 // Get returns the status code and body of url.
@@ -624,6 +647,7 @@ func (c *Client) hostClient(host []byte, isTLS bool) (*HostClient, error) {
 		RetryIfErrUpstream:            c.RetryIfErrUpstream,
 		ConnPoolStrategy:              c.ConnPoolStrategy,
 		StreamResponseBody:            c.StreamResponseBody,
+		MaxReplayBodySize:             c.MaxReplayBodySize,
 		clientReaderPool:              &c.readerPool,
 		clientWriterPool:              &c.writerPool,
 	}
@@ -1039,6 +1063,29 @@ type HostClient struct {
 	// known-length bodies for connection reuse and closes other body streams.
 	StreamResponseBody bool
 
+	// MaxReplayBodySize enables retaining a streamed request body so that
+	// retries and body-preserving redirects (307/308, and 301/302 on POST)
+	// can send the body again instead of failing or replaying an empty body.
+	//
+	// While the request is sent, the bytes consumed from the body stream are
+	// buffered in memory, up to this many bytes. On a retry the body is
+	// replayed from the buffer and the remainder is read from the stream,
+	// which keeps working when the connection is replaced, the TLS handshake
+	// is redone, or a dial reaches another upstream address.
+	//
+	// If more than this many bytes have been consumed when a replay is needed,
+	// the request fails with ErrBodyStreamNotReplayable rather than sending a
+	// truncated or empty body.
+	//
+	// The buffer is released as soon as the request (or redirect chain) ends
+	// and does not accumulate across requests.
+	//
+	// A value of zero (the default) disables replay buffering: streamed
+	// bodies are not retried, body-preserving redirects fail with
+	// ErrRedirectBodyStream, and retry counts, timeout budgets, and redirect
+	// behavior are otherwise unchanged.
+	MaxReplayBodySize int
+
 	connsCleanerRun bool
 }
 
@@ -1128,6 +1175,20 @@ func (c *HostClient) Post(dst []byte, url string, postArgs *Args) (statusCode in
 
 type clientDoer interface {
 	Do(req *Request, resp *Response) error
+}
+
+// replayBodySizer is implemented by clients that configure retention of a
+// streamed request body for retries and body-preserving redirects.
+type replayBodySizer interface {
+	replayBodyLimit() int
+}
+
+func (c *Client) replayBodyLimit() int {
+	return c.MaxReplayBodySize
+}
+
+func (c *HostClient) replayBodyLimit() int {
+	return c.MaxReplayBodySize
 }
 
 func clientGetURL(dst []byte, url string, c clientDoer) (statusCode int, body []byte, err error) {
@@ -1249,6 +1310,9 @@ var (
 	// ErrRedirectBodyStream is returned by clients when a redirect that keeps the request
 	// body is received for a request whose body is a stream. The hop that produced the
 	// redirect consumed the stream, so the body cannot be sent again.
+	//
+	// Configure Client.MaxReplayBodySize or HostClient.MaxReplayBodySize to retain the
+	// streamed body and follow such redirects instead.
 	ErrRedirectBodyStream = errors.New("fasthttp: cannot follow a body-preserving redirect for a request with a body stream")
 
 	// ErrHostClientRedirectToDifferentScheme is returned when a HostClient follows a redirect to a different protocol.
@@ -1318,6 +1382,23 @@ func doRequestFollowRedirects(
 	// time a redirect arrives req.IsBodyStream() is already false.
 	hasBodyStream := req.IsBodyStream()
 
+	// Install a replay buffer when the doer opts in. The buffer lives on the
+	// request, so it survives hops served by different HostClients, another
+	// scheme or address, fresh connections, and TLS re-handshakes. It is
+	// released when the chain ends; HostClient.Do adopts it for each hop.
+	replayOwned := false
+	if hasBodyStream && req.bodyReplay == nil {
+		if rs, ok := c.(replayBodySizer); ok && rs.replayBodyLimit() > 0 {
+			installBodyReplay(req, rs.replayBodyLimit())
+			replayOwned = true
+		}
+	}
+	defer func() {
+		if replayOwned {
+			_ = releaseBodyReplay(req)
+		}
+	}()
+
 	for {
 		req.SetRequestURI(url)
 		if err := req.parseURI(); err != nil {
@@ -1348,11 +1429,21 @@ func doRequestFollowRedirects(
 		ReleaseURI(redirectURI)
 
 		// Every redirect but 303 keeps the body, and a consumed stream cannot
-		// produce it again. Fail instead of following with an empty body, the
-		// same reason the retry path refuses to retry such a request.
+		// produce it again without retention. With replay buffering enabled,
+		// roll the retained body back to its first byte for the next hop;
+		// otherwise fail instead of following with an empty body.
 		if hasBodyStream && statusCode != StatusSeeOther {
-			err = ErrRedirectBodyStream
-			break
+			replay := req.bodyReplay
+			if replay == nil {
+				err = ErrRedirectBodyStream
+				break
+			}
+			if !replay.rewind() {
+				err = ErrBodyStreamNotReplayable
+				break
+			}
+			// The hop's write closed and detached the installed reader.
+			req.bodyStream = replay
 		}
 
 		switch {
@@ -1645,6 +1736,18 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 	attempts := 0
 	hasBodyStream := req.IsBodyStream()
 
+	// Retain a streamed body so a failed attempt can send it again on another
+	// connection. The redirect follower may have installed the replay state
+	// already: adopt it and leave its release to the redirect chain; when
+	// there is none, install one here if replay buffering is enabled and own
+	// its release until Do returns.
+	replay := req.bodyReplay
+	replayOwned := false
+	if hasBodyStream && replay == nil && c.MaxReplayBodySize > 0 {
+		replay = installBodyReplay(req, c.MaxReplayBodySize)
+		replayOwned = true
+	}
+
 	// If a request has a timeout we store the timeout
 	// and calculate a deadline so we can keep updating the
 	// timeout on each retry.
@@ -1675,7 +1778,20 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 			break
 		}
 
-		if hasBodyStream {
+		if replay != nil {
+			// Writing the attempt consumed and detached req.bodyStream, so
+			// roll the retained body back to its first byte and reinstall it
+			// for the next attempt, which runs on another connection. If the
+			// body ran past the retention limit, fail loudly instead of
+			// turning the retry into a body-less request.
+			if !replay.rewind() {
+				err = ErrBodyStreamNotReplayable
+				break
+			}
+			req.bodyStream = replay
+		} else if hasBodyStream {
+			// Replay buffering is disabled and the consumed stream cannot be
+			// produced again, so stop retrying instead of resending empty.
 			break
 		}
 		// Path prioritization based on ease of computation
@@ -1707,6 +1823,15 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 
 	// Restore the original timeout.
 	req.timeout = timeout
+
+	// Release the retained body when this Do owned it. State adopted from a
+	// redirect chain stays alive until the chain ends. A close error from the
+	// wrapped stream only matters when the request otherwise succeeded.
+	if replayOwned {
+		if closeErr := releaseBodyReplay(req); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}
 
 	if err == io.EOF {
 		err = ErrConnectionClosed

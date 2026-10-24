@@ -44,6 +44,13 @@ type Request struct {
 	w                requestBodyWriter
 	body             *bytebufferpool.ByteBuffer
 
+	// bodyReplay retains consumed bytes of a streamed request body so a client
+	// retry or a body-preserving redirect can send the body again. It is
+	// installed by the client when replay buffering is enabled and always
+	// released before the logical request ends. nil for non-streamed bodies
+	// and when the feature is disabled.
+	bodyReplay *bodyReplay
+
 	// serverStream is the request stream the server drains and releases
 	// after the handler returns. Its prefetched bytes live in body, so body
 	// must stay out of the pool until then, whether or not the stream is
@@ -1039,6 +1046,13 @@ func (req *Request) ResetBody() {
 	req.bodyRaw = nil
 	req.RemoveMultipartFormFiles()
 	req.closeBodyStream() //nolint:errcheck
+	// closeBodyStream only saw the replay wrapper, whose Close is a no-op:
+	// finish the replay state itself so the wrapped stream is closed once and
+	// its retention buffer goes back to the pool instead of leaking.
+	if req.bodyReplay != nil {
+		req.bodyReplay.finish() //nolint:errcheck
+		req.bodyReplay = nil
+	}
 	// Not req.bodyStream: the handler may have closed the stream already,
 	// which takes it off the request while the server still drains it.
 	rs := req.serverStream
@@ -1125,6 +1139,8 @@ func swapRequestBody(a, b *Request) {
 	a.body, b.body = b.body, a.body
 	a.bodyRaw, b.bodyRaw = b.bodyRaw, a.bodyRaw
 	a.bodyStream, b.bodyStream = b.bodyStream, a.bodyStream
+	// The replay wrapper and its state must travel together.
+	a.bodyReplay, b.bodyReplay = b.bodyReplay, a.bodyReplay
 
 	// This code assumes that if a requestStream was swapped the headers are also swapped or copied.
 	if rs, ok := a.bodyStream.(*requestStream); ok {

@@ -6576,3 +6576,678 @@ func TestHostClientPreservesNoDefaultContentType(t *testing.T) {
 		}
 	}
 }
+
+// replayCloseReader is a streamed request body that records Close calls.
+type replayCloseReader struct {
+	io.Reader
+	closed atomic.Bool
+}
+
+func (r *replayCloseReader) Close() error {
+	r.closed.Store(true)
+	return nil
+}
+
+func newReplayBodyReader(body string) *replayCloseReader {
+	return &replayCloseReader{Reader: strings.NewReader(body)}
+}
+
+// replayFailFirstConn turns the first response read into an EOF, but only
+// after the server side has consumed the whole request body. The client must
+// therefore replay the entire body on a freshly dialed connection.
+type replayFailFirstConn struct {
+	net.Conn
+	bodyConsumed <-chan struct{}
+	used         atomic.Bool
+}
+
+func (c *replayFailFirstConn) Read(p []byte) (int, error) {
+	if !c.used.Swap(true) {
+		<-c.bodyConsumed
+		return 0, io.EOF
+	}
+	return c.Conn.Read(p)
+}
+
+// replayHarness starts an in-memory server that records and echoes every
+// request body. The first dialsCount connection fails its first response read
+// after the server fully read that body.
+func replayHarness(t *testing.T) (dial DialFunc, dialsCount *atomic.Int32, receivedBodies func() [][]byte) {
+	t.Helper()
+
+	ln := fasthttputil.NewInmemoryListener()
+	t.Cleanup(func() { ln.Close() })
+
+	var (
+		mu     sync.Mutex
+		bodies [][]byte
+	)
+	firstBodyConsumed := make(chan struct{})
+
+	s := &Server{
+		Handler: func(ctx *RequestCtx) {
+			body := append([]byte{}, ctx.PostBody()...)
+			mu.Lock()
+			bodies = append(bodies, body)
+			first := len(bodies) == 1
+			mu.Unlock()
+			if first {
+				close(firstBodyConsumed)
+			}
+			_, _ = ctx.Write(body)
+		},
+	}
+	go func() { _ = s.Serve(ln) }()
+
+	var dials atomic.Int32
+	dial = func(_ string) (net.Conn, error) {
+		n := dials.Add(1)
+		conn, err := ln.Dial()
+		if err != nil {
+			return nil, err
+		}
+		if n == 1 {
+			return &replayFailFirstConn{Conn: conn, bodyConsumed: firstBodyConsumed}, nil
+		}
+		return conn, nil
+	}
+	return dial, &dials, func() [][]byte {
+		mu.Lock()
+		defer mu.Unlock()
+		out := make([][]byte, len(bodies))
+		for i, b := range bodies {
+			out[i] = append([]byte{}, b...)
+		}
+		return out
+	}
+}
+
+func replayHostClient(t *testing.T, dial DialFunc, maxReplayBodySize int) *HostClient {
+	t.Helper()
+	return &HostClient{
+		Addr:                      "example.com:80",
+		Dial:                      dial,
+		MaxReplayBodySize:         maxReplayBodySize,
+		MaxIdemponentCallAttempts: 5,
+	}
+}
+
+// A streamed request body must be sent in full again on another connection
+// when the first attempt dies after the body was written; neither attempt may
+// observe an empty or truncated body.
+func TestClientReplayStreamBodyOnRetry(t *testing.T) {
+	t.Parallel()
+
+	dial, dialsCount, receivedBodies := replayHarness(t)
+
+	bodyText := strings.Repeat("abcdefgh", 1000) // 8000 bytes
+	c := replayHostClient(t, dial, len(bodyText))
+
+	var req Request
+	var resp Response
+	req.SetRequestURI("http://example.com/put")
+	req.Header.SetMethod(MethodPut)
+	body := newReplayBodyReader(bodyText)
+	req.SetBodyStream(body, len(bodyText))
+
+	if err := c.Do(&req, &resp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := string(resp.Body()); got != bodyText {
+		t.Fatalf("unexpected echo %q, want %q", got[:min(32, len(got))], bodyText[:32])
+	}
+	if got := dialsCount.Load(); got != 2 {
+		t.Fatalf("got %d dials, want 2", got)
+	}
+	bodies := receivedBodies()
+	if len(bodies) != 2 {
+		t.Fatalf("server got %d requests, want 2", len(bodies))
+	}
+	for i, got := range bodies {
+		if string(got) != bodyText {
+			t.Fatalf("attempt %d body length %d, want %d", i+1, len(got), len(bodyText))
+		}
+	}
+	if !body.closed.Load() {
+		t.Fatal("streamed body was not closed after the request ended")
+	}
+	if req.bodyReplay != nil {
+		t.Fatal("replay buffer state leaked on the request")
+	}
+}
+
+// Non-idempotent methods opt in to retries through RetryIfErr; replay must
+// work there too.
+func TestClientReplayStreamBodyOnRetryWithRetryIfErr(t *testing.T) {
+	t.Parallel()
+
+	dial, dialsCount, receivedBodies := replayHarness(t)
+	c := replayHostClient(t, dial, 4096)
+	c.RetryIfErr = func(_ *Request, _ int, _ error) (bool, bool) {
+		return false, true
+	}
+
+	bodyText := strings.Repeat("xy", 1000) // 2000 bytes
+
+	var req Request
+	var resp Response
+	req.SetRequestURI("http://example.com/post")
+	req.Header.SetMethod(MethodPost)
+	req.SetBodyStream(newReplayBodyReader(bodyText), len(bodyText))
+
+	if err := c.Do(&req, &resp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := string(resp.Body()); got != bodyText {
+		t.Fatal("replayed body mismatch")
+	}
+	if got := dialsCount.Load(); got != 2 {
+		t.Fatalf("got %d dials, want 2", got)
+	}
+	if bodies := receivedBodies(); len(bodies) != 2 || string(bodies[1]) != bodyText {
+		t.Fatalf("unexpected server bodies: %v", bodies)
+	}
+}
+
+// The Client-level option is copied to the HostClient that serves the host,
+// so plain Do retries replay streamed bodies without following redirects.
+func TestClientReplayStreamBodyOnRetryViaClient(t *testing.T) {
+	t.Parallel()
+
+	dial, dialsCount, receivedBodies := replayHarness(t)
+	c := &Client{
+		Dial:                      dial,
+		MaxReplayBodySize:         256,
+		MaxIdemponentCallAttempts: 5,
+	}
+
+	bodyText := strings.Repeat("z", 200)
+
+	var req Request
+	var resp Response
+	req.SetRequestURI("http://example.com/put")
+	req.Header.SetMethod(MethodPut)
+	req.SetBodyStream(newReplayBodyReader(bodyText), len(bodyText))
+
+	if err := c.Do(&req, &resp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := string(resp.Body()); got != bodyText {
+		t.Fatal("replayed body mismatch via Client")
+	}
+	if got := dialsCount.Load(); got != 2 {
+		t.Fatalf("got %d dials, want 2", got)
+	}
+	if bodies := receivedBodies(); len(bodies) != 2 || string(bodies[1]) != bodyText {
+		t.Fatalf("unexpected server bodies: %d", len(bodies))
+	}
+	if req.bodyReplay != nil {
+		t.Fatal("replay buffer state leaked on the request")
+	}
+}
+
+// Chunked (unknown length) streamed bodies replay as well.
+func TestClientReplayChunkedStreamBodyOnRetry(t *testing.T) {
+	t.Parallel()
+
+	dial, _, receivedBodies := replayHarness(t)
+	c := replayHostClient(t, dial, 1<<20)
+
+	bodyText := strings.Repeat("chunk-body-", 500)
+
+	var req Request
+	var resp Response
+	req.SetRequestURI("http://example.com/put")
+	req.Header.SetMethod(MethodPut)
+	req.SetBodyStream(newReplayBodyReader(bodyText), -1)
+
+	if err := c.Do(&req, &resp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := string(resp.Body()); got != bodyText {
+		t.Fatal("replayed chunked body mismatch")
+	}
+	for i, got := range receivedBodies() {
+		if string(got) != bodyText {
+			t.Fatalf("attempt %d chunked body mismatch", i+1)
+		}
+	}
+}
+
+// When the consumed body runs past the retention limit a retry must surface a
+// recognizable error instead of resending an empty or partial body.
+func TestClientReplayStreamBodyOverLimit(t *testing.T) {
+	t.Parallel()
+
+	dial, dialsCount, receivedBodies := replayHarness(t)
+	c := replayHostClient(t, dial, 64)
+
+	bodyText := strings.Repeat("0123456789", 1000) // 10000 bytes > 64
+
+	var req Request
+	var resp Response
+	req.SetRequestURI("http://example.com/put")
+	req.Header.SetMethod(MethodPut)
+	body := newReplayBodyReader(bodyText)
+	req.SetBodyStream(body, len(bodyText))
+
+	err := c.Do(&req, &resp)
+	if !errors.Is(err, ErrBodyStreamNotReplayable) {
+		t.Fatalf("got %v, want ErrBodyStreamNotReplayable", err)
+	}
+	if got := dialsCount.Load(); got != 1 {
+		t.Fatalf("got %d dials, want 1: a body-less retry must not happen", got)
+	}
+	bodies := receivedBodies()
+	if len(bodies) != 1 || string(bodies[0]) != bodyText {
+		t.Fatalf("first attempt must still carry the full body, got %d requests", len(bodies))
+	}
+	if !body.closed.Load() {
+		t.Fatal("streamed body was not closed after the failed request")
+	}
+	if req.bodyReplay != nil {
+		t.Fatal("replay buffer state leaked on the request")
+	}
+}
+
+// MaxIdemponentCallAttempts still bounds retries when replay buffering is on.
+func TestClientReplayStreamBodyRespectsMaxAttempts(t *testing.T) {
+	t.Parallel()
+
+	dial, dialsCount, _ := replayHarness(t)
+	c := replayHostClient(t, dial, 1<<20)
+	c.MaxIdemponentCallAttempts = 1
+
+	bodyText := "abc"
+
+	var req Request
+	var resp Response
+	req.SetRequestURI("http://example.com/put")
+	req.Header.SetMethod(MethodPut)
+	req.SetBodyStream(newReplayBodyReader(bodyText), len(bodyText))
+
+	err := c.Do(&req, &resp)
+	if err == nil {
+		t.Fatal("expected the first attempt error")
+	}
+	if errors.Is(err, ErrBodyStreamNotReplayable) {
+		t.Fatalf("replay budget error must not replace the attempt error: %v", err)
+	}
+	if got := dialsCount.Load(); got != 1 {
+		t.Fatalf("got %d dials, want 1", got)
+	}
+}
+
+// With replay buffering disabled (the default), streamed bodies still give up
+// retrying exactly as before.
+func TestClientReplayStreamBodyDisabledByDefault(t *testing.T) {
+	t.Parallel()
+
+	dial, dialsCount, _ := replayHarness(t)
+	c := replayHostClient(t, dial, 0)
+
+	bodyText := "abc"
+
+	var req Request
+	var resp Response
+	req.SetRequestURI("http://example.com/put")
+	req.Header.SetMethod(MethodPut)
+	body := newReplayBodyReader(bodyText)
+	req.SetBodyStream(body, len(bodyText))
+
+	err := c.Do(&req, &resp)
+	if err == nil {
+		t.Fatal("expected error from being unable to retry a body stream")
+	}
+	if errors.Is(err, ErrBodyStreamNotReplayable) {
+		t.Fatalf("disabled replay must not synthesize a replay error: %v", err)
+	}
+	if got := dialsCount.Load(); got != 1 {
+		t.Fatalf("got %d dials, want 1", got)
+	}
+	if req.bodyReplay != nil {
+		t.Fatal("replay state must not be installed when disabled")
+	}
+	if !body.closed.Load() {
+		t.Fatal("streamed body was not closed")
+	}
+}
+
+// Body-preserving redirects replay the streamed body onto the next hop.
+func TestClientReplayRedirectBodyStream(t *testing.T) {
+	t.Parallel()
+
+	ln := fasthttputil.NewInmemoryListener()
+	t.Cleanup(func() { ln.Close() })
+	s := &Server{
+		Handler: func(ctx *RequestCtx) {
+			switch string(ctx.Path()) {
+			case "/redirect-307":
+				ctx.Redirect("/landing", StatusTemporaryRedirect)
+			case "/redirect-308":
+				ctx.Redirect("/landing", StatusPermanentRedirect)
+			case "/redirect-chain":
+				ctx.Redirect("/redirect-307", StatusTemporaryRedirect)
+			case "/redirect-303":
+				ctx.Redirect("/landing", StatusSeeOther)
+			case "/landing":
+				_, _ = ctx.WriteString(string(ctx.Method()) + "|" + string(ctx.PostBody()))
+			default:
+				ctx.Error("not found", StatusNotFound)
+			}
+		},
+	}
+	go func() { _ = s.Serve(ln) }()
+
+	c := &HostClient{
+		Addr:                      "xxx",
+		Dial:                      func(string) (net.Conn, error) { return ln.Dial() },
+		MaxReplayBodySize:         64,
+		MaxIdemponentCallAttempts: 5,
+	}
+
+	for _, tc := range []struct {
+		name string
+		path string
+		want string
+	}{
+		{"307", "/redirect-307", "POST|hello"},
+		{"308", "/redirect-308", "POST|hello"},
+		{"307 chain", "/redirect-chain", "POST|hello"},
+		// 303 drops the body and switches to GET: no replay is needed.
+		{"303", "/redirect-303", "GET|"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var req Request
+			var resp Response
+			req.SetRequestURI("http://xxx" + tc.path)
+			req.Header.SetMethod(MethodPost)
+			req.SetBodyStream(newReplayBodyReader("hello"), 5)
+
+			if err := c.DoRedirects(&req, &resp, 16); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := string(resp.Body()); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	// A body larger than the retention limit fails the redirect with the
+	// recognizable error, before any empty body reaches the landing hop.
+	t.Run("over limit", func(t *testing.T) {
+		largerLn := fasthttputil.NewInmemoryListener()
+		defer largerLn.Close()
+		var landingHits atomic.Int32
+		largerServer := &Server{
+			Handler: func(ctx *RequestCtx) {
+				switch string(ctx.Path()) {
+				case "/redirect-307":
+					ctx.Redirect("/landing", StatusTemporaryRedirect)
+				case "/landing":
+					landingHits.Add(1)
+				}
+			},
+		}
+		go func() { _ = largerServer.Serve(largerLn) }()
+
+		smallCap := &HostClient{
+			Addr:              "xxx",
+			Dial:              func(string) (net.Conn, error) { return largerLn.Dial() },
+			MaxReplayBodySize: 4,
+		}
+		var req Request
+		var resp Response
+		req.SetRequestURI("http://xxx/redirect-307")
+		req.Header.SetMethod(MethodPost)
+		req.SetBodyStream(newReplayBodyReader("this body is too big"), 21)
+
+		err := smallCap.DoRedirects(&req, &resp, 16)
+		if !errors.Is(err, ErrBodyStreamNotReplayable) {
+			t.Fatalf("got %v, want ErrBodyStreamNotReplayable", err)
+		}
+		if got := landingHits.Load(); got != 0 {
+			t.Fatalf("landing hop was hit %d times with an unplayable body", got)
+		}
+	})
+}
+
+// The retention buffer lives on the request, so a redirect to another host
+// (a different HostClient, address and potentially scheme) replays the body.
+func TestClientReplayRedirectAcrossHosts(t *testing.T) {
+	t.Parallel()
+
+	lnA := fasthttputil.NewInmemoryListener()
+	lnB := fasthttputil.NewInmemoryListener()
+	t.Cleanup(func() {
+		lnA.Close()
+		lnB.Close()
+	})
+
+	newRedirectServer := func(ln *fasthttputil.InmemoryListener) {
+		s := &Server{
+			Handler: func(ctx *RequestCtx) {
+				ctx.Redirect("http://b.example/landing", StatusTemporaryRedirect)
+			},
+		}
+		go func() { _ = s.Serve(ln) }()
+	}
+	newLandingServer := func(ln *fasthttputil.InmemoryListener, hits *atomic.Int32) {
+		s := &Server{
+			Handler: func(ctx *RequestCtx) {
+				hits.Add(1)
+				_, _ = ctx.WriteString(string(ctx.Method()) + "|" + string(ctx.PostBody()))
+			},
+		}
+		go func() { _ = s.Serve(ln) }()
+	}
+
+	var landingHits atomic.Int32
+	newRedirectServer(lnA)
+	newLandingServer(lnB, &landingHits)
+
+	c := &Client{
+		MaxReplayBodySize:         64,
+		MaxIdemponentCallAttempts: 5,
+		Dial: func(addr string) (net.Conn, error) {
+			switch {
+			case strings.HasPrefix(addr, "b."):
+				return lnB.Dial()
+			default:
+				return lnA.Dial()
+			}
+		},
+	}
+
+	var req Request
+	var resp Response
+	req.SetRequestURI("http://a.example/go")
+	req.Header.SetMethod(MethodPost)
+	req.SetBodyStream(newReplayBodyReader("cross-host"), 10)
+
+	if err := c.DoRedirects(&req, &resp, 16); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := landingHits.Load(); got != 1 {
+		t.Fatalf("landing got %d requests, want 1", got)
+	}
+	if got := string(resp.Body()); got != "POST|cross-host" {
+		t.Fatalf("got %q, want POST|cross-host", got)
+	}
+	if req.bodyReplay != nil {
+		t.Fatal("replay buffer state leaked after the redirect chain")
+	}
+}
+
+// Buffers must be returned at the end of every request and never accumulate
+// with the request count.
+func TestClientReplayBufferReleased(t *testing.T) {
+	t.Parallel()
+
+	ln := fasthttputil.NewInmemoryListener()
+	t.Cleanup(func() { ln.Close() })
+	s := &Server{
+		Handler: func(ctx *RequestCtx) {
+			_, _ = ctx.Write(ctx.PostBody())
+		},
+	}
+	go func() { _ = s.Serve(ln) }()
+
+	c := &HostClient{
+		Addr:                      "xxx",
+		Dial:                      func(string) (net.Conn, error) { return ln.Dial() },
+		MaxReplayBodySize:         256,
+		MaxIdemponentCallAttempts: 5,
+	}
+
+	var req Request
+	var resp Response
+	for range 50 {
+		body := newReplayBodyReader("reusable body")
+		req.Reset()
+		req.SetRequestURI("http://xxx/landing")
+		req.Header.SetMethod(MethodPut)
+		req.SetBodyStream(body, len("reusable body"))
+		if err := c.Do(&req, &resp); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if req.bodyReplay != nil {
+			t.Fatal("replay buffer state leaked after request")
+		}
+		if !body.closed.Load() {
+			t.Fatal("streamed body was not closed after request")
+		}
+	}
+
+	// A failed replay releases the state too, and the request is reusable.
+	failLn := fasthttputil.NewInmemoryListener()
+	defer failLn.Close()
+	var (
+		failOnce     atomic.Bool
+		failConsumed = make(chan struct{})
+	)
+	failServer := &Server{
+		Handler: func(ctx *RequestCtx) {
+			_ = ctx.PostBody()
+			if failOnce.CompareAndSwap(false, true) {
+				close(failConsumed)
+			}
+		},
+	}
+	go func() { _ = failServer.Serve(failLn) }()
+
+	failDials := func(_ string) (net.Conn, error) {
+		conn, err := failLn.Dial()
+		if err != nil {
+			return nil, err
+		}
+		if !failOnce.Load() {
+			return &replayFailFirstConn{Conn: conn, bodyConsumed: failConsumed}, nil
+		}
+		return conn, nil
+	}
+
+	// After Reset the oversized failure from the previous exercise must not
+	// leave any state behind either. Drop the keep-alive conns pooled for the
+	// echo server so the new dialer is used.
+	c.CloseIdleConnections()
+	req.Reset()
+	req.SetRequestURI("http://xxx/landing")
+	req.Header.SetMethod(MethodPut)
+	oversized := newReplayBodyReader(strings.Repeat("y", 300))
+	req.SetBodyStream(oversized, 300)
+	c.Dial = failDials
+	c.MaxReplayBodySize = 4
+	err := c.Do(&req, &resp)
+	if !errors.Is(err, ErrBodyStreamNotReplayable) {
+		t.Fatalf("got %v, want ErrBodyStreamNotReplayable", err)
+	}
+	if req.bodyReplay != nil {
+		t.Fatal("replay buffer state leaked after failed request")
+	}
+	if !oversized.closed.Load() {
+		t.Fatal("oversized streamed body was not closed")
+	}
+
+	// The request is good for a normal call afterwards.
+	c.CloseIdleConnections()
+	c.Dial = func(string) (net.Conn, error) { return ln.Dial() }
+	c.MaxReplayBodySize = 256
+	req.Reset()
+	req.SetRequestURI("http://xxx/landing")
+	req.Header.SetMethod(MethodPut)
+	req.SetBodyStream(newReplayBodyReader("again"), 5)
+	if err := c.Do(&req, &resp); err != nil {
+		t.Fatalf("request after failed replay failed: %v", err)
+	}
+	if string(resp.Body()) != "again" {
+		t.Fatalf("unexpected body %q", resp.Body())
+	}
+}
+
+// Whitebox behavior of the retention reader itself.
+func TestBodyReplayReader(t *testing.T) {
+	t.Parallel()
+
+	t.Run("replays prefix and tail", func(t *testing.T) {
+		src := bytes.NewBufferString("hello world")
+		r := acquireBodyReplay(src, 11)
+
+		first, err := io.ReadAll(io.LimitReader(r, 5))
+		if err != nil || string(first) != "hello" {
+			t.Fatalf("first read: %q %v", first, err)
+		}
+		rest := make([]byte, 6)
+		n, err := io.ReadFull(r, rest)
+		if err != nil || string(rest[:n]) != " world" {
+			t.Fatalf("tail read: %q %v", rest[:n], err)
+		}
+		if r.overflow {
+			t.Fatal("unexpected overflow within the limit")
+		}
+		if !r.rewind() {
+			t.Fatal("replay must be possible within the limit")
+		}
+
+		got, err := io.ReadAll(r)
+		if err != nil || string(got) != "hello world" {
+			t.Fatalf("replayed body %q: %v", got, err)
+		}
+	})
+
+	t.Run("overflow is permanent", func(t *testing.T) {
+		src := bytes.NewBufferString("hello world")
+		r := acquireBodyReplay(src, 5)
+		got, err := io.ReadAll(r)
+		if err != nil || string(got) != "hello world" {
+			t.Fatalf("first pass %q: %v", got, err)
+		}
+		if !r.overflow {
+			t.Fatal("expected overflow past the 5 byte limit")
+		}
+		if r.rewind() {
+			t.Fatal("a body past the retention limit must not replay")
+		}
+	})
+
+	t.Run("close is deferred to finish", func(t *testing.T) {
+		src := &replayCloseReader{Reader: bytes.NewBufferString("abc")}
+		r := acquireBodyReplay(src, 3)
+		buf := make([]byte, 2)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Close(); err != nil {
+			t.Fatalf("attempt close: %v", err)
+		}
+		if src.closed.Load() {
+			t.Fatal("attempt close must not close the wrapped stream")
+		}
+		if err := r.finish(); err != nil {
+			t.Fatalf("finish: %v", err)
+		}
+		if !src.closed.Load() {
+			t.Fatal("finish must close the wrapped stream")
+		}
+	})
+}
