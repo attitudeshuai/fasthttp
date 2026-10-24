@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -245,6 +246,12 @@ type Server struct {
 	concurrencyCh     chan struct{}
 	concurrencyChOnce sync.Once
 
+	// rateLimiter holds the live per-source request rate limiter. It is
+	// built once from RateLimit when serving starts; nil means rate
+	// limiting is disabled.
+	rateLimiter         *rateLimiter
+	rateLimitConfigured bool
+
 	idleConns map[net.Conn]*atomic.Int64
 
 	// done is written under mu, but RequestCtx.Done() reads it without mu,
@@ -346,6 +353,30 @@ type Server struct {
 	// the concurrency limit in exceeded (default [when is 0]: don't sleep
 	// and accept new connections immediately).
 	SleepWhenConcurrencyLimitsExceeded time.Duration
+
+	// RateLimit optionally enables per-source request rate limiting.
+	//
+	// When set, every source (the peer IP, see MaxConnsPerIP) gets the
+	// configured token-bucket allowance: Rate requests per second on
+	// average, with a Burst of spare tokens that is replenished smoothly
+	// over time. All of a source's connections share one allowance, and
+	// the check-and-deduct step is atomic, so a burst of concurrent
+	// requests over several connections can never pass more than the
+	// configured burst.
+	//
+	// A request over the allowance is rejected on its own with
+	// 429 Too Many Requests and a Retry-After header, without calling
+	// Handler. Its connection stays open and keep serving, and requests
+	// from other sources are not affected.
+	//
+	// PerPath entries relax or tighten the allowance for individual,
+	// exactly matched request paths; Rate/Burst apply to every other
+	// path. Invalid configurations are reported with an error from
+	// Serve/ServeConn instead of silently becoming a zero allowance.
+	//
+	// nil (the default) disables rate limiting. The value must not be
+	// modified after serving has started.
+	RateLimit *RateLimitConfig
 
 	idleConnsMu sync.Mutex
 
@@ -2014,6 +2045,10 @@ func (s *Server) Serve(ln net.Listener) error {
 	maxWorkersCount := s.getConcurrency()
 
 	s.mu.Lock()
+	if err := s.configureRateLimiterLocked(); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	s.ln = append(s.ln, ln)
 	if s.done.Load() == nil {
 		done := make(chan struct{})
@@ -2257,6 +2292,13 @@ var (
 //
 // ServeConn closes c before returning.
 func (s *Server) ServeConn(c net.Conn) error {
+	s.mu.Lock()
+	err := s.configureRateLimiterLocked()
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+
 	if s.MaxConnsPerIP > 0 {
 		pic := wrapPerIPConn(s, c)
 		if pic == nil {
@@ -2273,7 +2315,7 @@ func (s *Server) ServeConn(c net.Conn) error {
 
 	s.open.Add(1)
 
-	err := s.serveConnCounted(c, false)
+	err = s.serveConnCounted(c, false)
 
 	if err != errHijacked {
 		errc := c.Close()
@@ -2331,6 +2373,52 @@ func (s *Server) GetOpenConnectionsCount() int32 {
 // This function is intended be used by monitoring systems.
 func (s *Server) GetRejectedConnectionsCount() uint32 {
 	return s.rejectedRequestsCount.Load()
+}
+
+// configureRateLimiterLocked builds the per-source request rate limiter from
+// RateLimit the first time serving starts. It must be called with s.mu held.
+// An invalid configuration is reported here, before any connection is
+// served, instead of silently turning into a zero allowance.
+func (s *Server) configureRateLimiterLocked() error {
+	if s.rateLimitConfigured {
+		return nil
+	}
+	s.rateLimitConfigured = true
+	if s.RateLimit == nil {
+		return nil
+	}
+	rl, err := newRateLimiter(s.RateLimit)
+	if err != nil {
+		return err
+	}
+	s.rateLimiter = rl
+	return nil
+}
+
+// GetRateLimitRejectedCount returns the total number of requests rejected by
+// the per-source rate limiter.
+//
+// This function is intended be used by monitoring systems.
+func (s *Server) GetRateLimitRejectedCount() uint64 {
+	rl := s.rateLimiter
+	if rl == nil {
+		return 0
+	}
+	return rl.rejectedCount()
+}
+
+// GetRateLimitRejectedCounts returns rate-limit rejection counts broken down
+// by reason: RateLimitRejectionReasonDefault for requests rejected by the
+// server-wide limit, and the request path for requests rejected by a
+// PerPath override. It returns nil when rate limiting is disabled.
+//
+// This function is intended be used by monitoring systems.
+func (s *Server) GetRateLimitRejectedCounts() map[string]uint64 {
+	rl := s.rateLimiter
+	if rl == nil {
+		return nil
+	}
+	return rl.rejectedCounts()
 }
 
 func (s *Server) getConcurrency() int {
@@ -2444,6 +2532,11 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 	}
 	writeTimeout := s.WriteTimeout
 	previousWriteTimeout := time.Duration(0)
+
+	// One source key per connection: every request arriving on any of the
+	// source's connections is checked against the same shared buckets.
+	rateLimitSrc := connRateLimitSource(c)
+	rateLimiter := s.rateLimiter
 
 	ctx := s.acquireCtx(c)
 	ctx.connTime = connTime
@@ -2737,9 +2830,24 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 		// has closed the stream.
 		ctx.Request.serverStream = reqStream
 
-		// If a client denies a request the handler should not be called
+		// If a client denies a request the handler should not be called.
+		//
+		// When per-source rate limiting is enabled, an over-quota request
+		// is rejected here on its own: the handler is skipped and the
+		// request gets a 429 with a Retry-After hint, while the connection
+		// stays alive and requests from other sources are untouched. When
+		// it is disabled, this path calls Handler exactly as before.
 		if continueReadingRequest {
-			s.Handler(ctx)
+			if rateLimiter != nil {
+				if allowed, retryAfter := rateLimiter.allowRequest(rateLimitSrc, ctx.Path()); !allowed {
+					ctx.Error("Too Many Requests: per-source request rate limit exceeded", StatusTooManyRequests)
+					ctx.Response.Header.Set(HeaderRetryAfter, strconv.Itoa(retryAfter))
+				} else {
+					s.Handler(ctx)
+				}
+			} else {
+				s.Handler(ctx)
+			}
 		}
 
 		timeoutResponse = ctx.timeoutResponse
